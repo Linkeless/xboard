@@ -56,7 +56,16 @@ class ClientController extends Controller
             $region = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) ? ($ip2region->memorySearch($ip)['region'] ?? null) : null;
             // get available servers
             $servers = ServerService::getAvailableServers($user);
-	    \Log::info('Available servers:', ['servers' => $servers]);
+            // inbound参数处理
+            if ($request->input('inbound') == 1) {
+                foreach ($servers as &$server) {
+                    if (isset($server['ips']) && is_array($server['ips']) && count($server['ips']) > 0) {
+                        $server['host'] = $server['ips'][0];
+                    }
+                }
+                unset($server);
+            }
+            \Log::info('Available servers');
             // filter servers
             $serversFiltered = $this->serverFilter($servers, $typesArr, $filterArr, $region, $supportHy2, $supportSs2022);
             $this->setSubscribeInfoToServers($serversFiltered, $user, count($servers) - count($serversFiltered));
