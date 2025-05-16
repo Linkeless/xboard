@@ -134,7 +134,7 @@ class ClientController extends Controller
             // Also maintain a sorted set of users by last activity
             Redis::zadd('active_users', $timestamp, $userId);
             
-            \Log::info("Request logged to Redis for user {$userId} from IP {$ip}");
+            // \Log::info("Request logged to Redis for user {$userId} from IP {$ip}");
         } catch (\Exception $e) {
             \Log::error("Failed to log request to Redis: " . $e->getMessage());
         }
