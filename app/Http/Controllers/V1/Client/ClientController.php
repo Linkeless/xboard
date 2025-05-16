@@ -8,6 +8,7 @@ use App\Services\ServerService;
 use App\Services\UserService;
 use App\Utils\Helper;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Redis;
 
 class ClientController extends Controller
 {
@@ -48,6 +49,10 @@ class ClientController extends Controller
         $supportHy2 = $version ? collect(self::SupportedHy2ClientVersions)
                 ->contains(fn($minVersion, $client) => stripos($flag, $client) !== false && $this->versionCompare($version, $minVersion)) : true;
         $user = $request->user;
+        
+        // Log request to Redis
+        $this->logRequestToRedis($ip, $user, $request);
+        
         // account not expired and is not banned.
         $userService = new UserService();
         if ($userService->isAvailable($user)) {
@@ -57,10 +62,11 @@ class ClientController extends Controller
             // get available servers
             $servers = ServerService::getAvailableServers($user);
             // inbound参数处理
-            if ($request->input('inbound') == 1) {
+            $inboundIndex = (int)$request->input('inbound');
+            if ($inboundIndex > 0) {
                 foreach ($servers as &$server) {
-                    if (isset($server['ips']) && is_array($server['ips']) && count($server['ips']) > 0) {
-                        $server['host'] = $server['ips'][0];
+                    if (isset($server['ips']) && is_array($server['ips']) && count($server['ips']) >= $inboundIndex) {
+                        $server['host'] = $server['ips'][$inboundIndex - 1];
                     }
                 }
                 unset($server);
@@ -87,6 +93,53 @@ class ClientController extends Controller
             return $class->handle();
         }
     }
+    
+    /**
+     * Log request information to Redis
+     * 
+     * @param string $ip
+     * @param array $user
+     * @param Request $request
+     * @return void
+     */
+    private function logRequestToRedis($ip, $user, Request $request)
+    {
+        try {
+            $timestamp = time();
+            $userId = $user['id'] ?? 'unknown';
+            $email = $user['email'] ?? 'unknown';
+            
+            // Create a Redis key for this user
+            $redisKey = "user_requests:{$userId}";
+            
+            // Prepare request data
+            $requestData = json_encode([
+                'ip' => $ip,
+                'user_id' => $userId,
+                'email' => $email,
+                'timestamp' => $timestamp,
+                'datetime' => date('Y-m-d H:i:s', $timestamp),
+                'user_agent' => $request->header('User-Agent', ''),
+            ]);
+            
+            // Add to a list of requests for this user (newest first)
+            Redis::lpush($redisKey, $requestData);
+            
+            // Trim the list to keep only the most recent 100 entries
+            Redis::ltrim($redisKey, 0, 99);
+            
+            // Set expiration (e.g., 7 days)
+            Redis::expire($redisKey, 7 * 24 * 60 * 60);
+            
+            // Also maintain a sorted set of users by last activity
+            Redis::zadd('active_users', $timestamp, $userId);
+            
+            \Log::info("Request logged to Redis for user {$userId} from IP {$ip}");
+        } catch (\Exception $e) {
+            \Log::error("Failed to log request to Redis: " . $e->getMessage());
+        }
+    }
+    
     /**
      * Summary of serverFilter
      * @param mixed $typesArr

@@ -16,6 +16,9 @@ class ClientRoute
             // App
             $router->get('/app/getConfig', 'V1\\Client\\AppController@getConfig');
             $router->get('/app/getVersion', 'V1\\Client\\AppController@getVersion');
+            // Subscription Logs
+            $router->get('/subscription/recent-requests', 'V1\\Client\\SubscriptionLogController@getRecentRequests');
+            $router->get('/subscription/active-users', 'V1\\Client\\SubscriptionLogController@getActiveUsers');
         });
     }
 }
