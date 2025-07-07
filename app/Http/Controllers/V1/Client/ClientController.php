@@ -34,6 +34,13 @@ class ClientController extends Controller
 
     public function subscribe(Request $request)
     {
+        // 只允许GET请求
+        if (!$request->isMethod('GET')) {
+            return response()->json([
+                'error' => 'Method not allowed. Only GET requests are permitted.'
+            ], 405);
+        }
+        
         // filter types
         $types = $request->input('types', 'all');
         $typesArr = $types === 'all' ? self::AllowedTypes : array_values(array_intersect(explode('|', str_replace(['|', '｜', ','], "|", $types)), self::AllowedTypes));
@@ -44,14 +51,24 @@ class ClientController extends Controller
         $filterArr = mb_strlen($filter = $request->input('filter')) > 20 ? null : explode("|", str_replace(['|', '｜', ','], "|", $filter));
         $flag = strtolower($request->input('flag') ?? $request->header('User-Agent', ''));
         $ip = $this->getOriginalIp();
+        
         // get client version
         $version = preg_match('/\/v?(\d+(\.\d+){0,2})/', $flag, $matches) ? $matches[1] : null;
         $supportHy2 = $version ? collect(self::SupportedHy2ClientVersions)
                 ->contains(fn($minVersion, $client) => stripos($flag, $client) !== false && $this->versionCompare($version, $minVersion)) : true;
         $user = $request->user;
         
-        // Log request to Redis
+        // Log request to Redis (记录所有请求，包括subconverter请求)
         $this->logRequestToRedis($ip, $user, $request);
+        
+        // 检查subconverter-request请求头的白名单限制
+        if ($request->hasHeader('subconverter-request')) {
+            if (!$this->isIpInSubconverterWhitelist($ip, $request)) {
+                return response()->json([
+                    'error' => 'Access denied: IP not in subconverter whitelist'
+                ], 403);
+            }
+        }
         
         // account not expired and is not banned.
         $userService = new UserService();
@@ -337,5 +354,106 @@ class ClientController extends Controller
         
         // 默认回退到getClientIp方法
         return $request->getClientIp();
-    }    
+    }
+    
+    /**
+     * 检查IP是否在subconverter请求白名单中
+     * 
+     * @param string $ip
+     * @param Request $request
+     * @return bool
+     */
+    private function isIpInSubconverterWhitelist(string $ip, Request $request): bool
+    {
+        // 从配置中获取白名单IP列表
+        $whitelist = config('app.subconverter_whitelist', []);
+        
+        // 如果配置为空，尝试从环境变量获取
+        if (empty($whitelist)) {
+            $whitelistStr = env('SUBCONVERTER_WHITELIST', '');
+            $whitelist = !empty($whitelistStr) ? explode(',', $whitelistStr) : [];
+        }
+        
+        // 默认白名单（本地IP）
+        if (empty($whitelist)) {
+            $whitelist = [
+                '127.0.0.1',
+                '::1',
+                'localhost',
+                '8.217.222.78'
+            ];
+        }
+        
+        // 需要检查的IP列表
+        $ipsToCheck = [$ip];
+        
+        // 添加X-Forwarded-For头中的IP
+        if ($request->header('X-Forwarded-For')) {
+            $forwardedIps = explode(',', $request->header('X-Forwarded-For'));
+            foreach ($forwardedIps as $forwardedIp) {
+                $ipsToCheck[] = trim($forwardedIp);
+            }
+        }
+        
+        // 检查所有IP是否有任何一个在白名单中
+        foreach ($ipsToCheck as $checkIp) {
+            if ($this->checkSingleIpInWhitelist($checkIp, $whitelist)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * 检查单个IP是否在白名单中
+     * 
+     * @param string $ip
+     * @param array $whitelist
+     * @return bool
+     */
+    private function checkSingleIpInWhitelist(string $ip, array $whitelist): bool
+    {
+        // 检查IP是否在白名单中
+        foreach ($whitelist as $whiteIp) {
+            $whiteIp = trim($whiteIp);
+            
+            // 精确匹配
+            if ($ip === $whiteIp) {
+                return true;
+            }
+            
+            // 支持CIDR格式的IP段匹配
+            if (strpos($whiteIp, '/') !== false) {
+                if ($this->ipInCidr($ip, $whiteIp)) {
+                    return true;
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * 检查IP是否在CIDR范围内
+     * 
+     * @param string $ip
+     * @param string $cidr
+     * @return bool
+     */
+    private function ipInCidr(string $ip, string $cidr): bool
+    {
+        list($subnet, $mask) = explode('/', $cidr);
+        
+        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) || 
+            !filter_var($subnet, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            return false;
+        }
+        
+        $ipLong = ip2long($ip);
+        $subnetLong = ip2long($subnet);
+        $maskLong = -1 << (32 - (int)$mask);
+        
+        return ($ipLong & $maskLong) === ($subnetLong & $maskLong);
+    }
 }
