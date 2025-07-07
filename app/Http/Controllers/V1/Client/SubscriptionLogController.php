@@ -57,14 +57,6 @@ class SubscriptionLogController extends Controller
             }
         }
         
-        // Sort by datetime descending (most recent first)
-        usort($formattedLogs, function($a, $b) {
-            return strtotime($b['datetime']) - strtotime($a['datetime']);
-        });
-        
-        // Limit to 10 most recent entries
-        $formattedLogs = array_slice($formattedLogs, 0, 10);
-        
         return response()->json([
             'success' => true,
             'data' => [
@@ -138,7 +130,7 @@ class SubscriptionLogController extends Controller
         
         try {
             // Call ipinfo.io API
-            $response = Http::get("https://api.ip.sb/geoip/{$ip}");
+            $response = Http::get("https://ipinfo.io/{$ip}/json");
             
             if ($response->successful()) {
                 $ipInfo = $response->json();

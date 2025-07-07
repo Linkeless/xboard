@@ -43,7 +43,7 @@ class ClientController extends Controller
         // filter keyword
         $filterArr = mb_strlen($filter = $request->input('filter')) > 20 ? null : explode("|", str_replace(['|', '｜', ','], "|", $filter));
         $flag = strtolower($request->input('flag') ?? $request->header('User-Agent', ''));
-        $ip = $request->input('ip', $request->ip());
+        $ip = $this->getOriginalIp();
         // get client version
         $version = preg_match('/\/v?(\d+(\.\d+){0,2})/', $flag, $matches) ? $matches[1] : null;
         $supportHy2 = $version ? collect(self::SupportedHy2ClientVersions)
@@ -120,6 +120,7 @@ class ClientController extends Controller
                 'timestamp' => $timestamp,
                 'datetime' => date('Y-m-d H:i:s', $timestamp),
                 'user_agent' => $request->header('User-Agent', ''),
+                'request_headers' => $request->headers->all(),
             ]);
             
             // Add to a list of requests for this user (newest first)
@@ -299,4 +300,42 @@ class ClientController extends Controller
         // 版本号相等
         return true;
     }
+
+
+    /**
+     * 获取客户端的原始IP地址
+     * 
+     * @return string
+     */
+    protected function getOriginalIp(): string
+    {
+        $request = request();
+        
+        // 首先检查请求参数中是否有ip参数
+        if ($request->has('ip')) {
+            return $request->input('ip');
+        }
+        
+        // 检查Cloudflare的CF-Connecting-IP头
+        if ($request->header('CF-Connecting-IP')) {
+            return $request->header('CF-Connecting-IP');
+        }
+        
+        // 检查是否存在X-Forwarded-For头
+        if ($request->header('X-Forwarded-For')) {
+            // X-Forwarded-For格式为: "客户端IP, 代理1 IP, 代理2 IP"
+            // 取第一个IP，即最原始的客户端IP
+            $ips = explode(',', $request->header('X-Forwarded-For'));
+            return trim($ips[0]);
+        }
+        
+        // 尝试获取全部IP链并取第一个
+        $ips = $request->ips();
+        if (!empty($ips)) {
+            return $ips[0];
+        }
+        
+        // 默认回退到getClientIp方法
+        return $request->getClientIp();
+    }    
 }
