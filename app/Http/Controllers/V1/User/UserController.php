@@ -122,6 +122,7 @@ class UserController extends Controller
     {
         $user = User::where('id', $request->user['id'])
             ->select([
+                'id',
                 'plan_id',
                 'token',
                 'expired_at',
@@ -141,7 +142,17 @@ class UserController extends Controller
                 return $this->fail([400, __('Subscription plan does not exist')]);
             }
         }
-        $user['subscribe_url'] = Helper::getSubscribeUrl($user['token']);
+        
+        // Generate HMAC token with timestamp and user ID
+        $secretKey = 'fuckhmac'; // Same secret key as in Client middleware
+        $timestamp = time();
+        $timestampHex = sprintf('%08x', $timestamp); // 8位十六进制时间戳 (用于唯一性，不限制过期)
+        $userIdHex = sprintf('%08x', $user->id); // 8位十六进制用户ID
+        $hmacSignature = substr(hash_hmac('sha256', $user->id . '|' . $timestamp . '|' . $user->token, $secretKey), 0, 16); // 16位签名
+        $hmacToken = $timestampHex . $userIdHex . $hmacSignature;
+        
+        $user['token'] = $hmacToken;
+        $user['subscribe_url'] = Helper::getSubscribeUrl($hmacToken);
         $userService = new UserService();
         $user['reset_day'] = $userService->getResetDay($user);
         return $this->success($user);
@@ -158,7 +169,16 @@ class UserController extends Controller
         if (!$user->save()) {
             return $this->fail([400, __('Reset failed')]);
         }
-        return $this->success(Helper::getSubscribeUrl($user->token));
+        
+        // Generate HMAC token with timestamp and user ID for subscribe URL
+        $secretKey = 'fuckhmac'; // Same secret key as in Client middleware
+        $timestamp = time();
+        $timestampHex = sprintf('%08x', $timestamp); // 8位十六进制时间戳 (用于唯一性，不限制过期)
+        $userIdHex = sprintf('%08x', $user->id); // 8位十六进制用户ID
+        $hmacSignature = substr(hash_hmac('sha256', $user->id . '|' . $timestamp . '|' . $user->token, $secretKey), 0, 16); // 16位签名
+        $hmacToken = $timestampHex . $userIdHex . $hmacSignature;
+        
+        return $this->success(Helper::getSubscribeUrl($hmacToken));
     }
 
     public function update(UserUpdate $request)

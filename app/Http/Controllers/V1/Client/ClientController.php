@@ -34,10 +34,10 @@ class ClientController extends Controller
 
     public function subscribe(Request $request)
     {
-        // 只允许GET请求
-        if (!$request->isMethod('GET')) {
+        // 只允许GET和HEAD请求
+        if (!$request->isMethod('GET') && !$request->isMethod('HEAD')) {
             return response()->json([
-                'error' => 'Method not allowed. Only GET requests are permitted.'
+                'error' => 'Method not allowed. Only GET and HEAD requests are permitted.'
             ], 405);
         }
         
