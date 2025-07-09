@@ -15,6 +15,7 @@ use App\Services\AuthService;
 use App\Services\UserService;
 use App\Utils\CacheKey;
 use App\Utils\Helper;
+use App\Utils\HmacHelper;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 
@@ -144,12 +145,7 @@ class UserController extends Controller
         }
         
         // Generate HMAC token with timestamp and user ID
-        $secretKey = 'fuckhmac'; // Same secret key as in Client middleware
-        $timestamp = time();
-        $timestampHex = sprintf('%08x', $timestamp); // 8位十六进制时间戳 (用于唯一性，不限制过期)
-        $userIdHex = sprintf('%08x', $user->id); // 8位十六进制用户ID
-        $hmacSignature = substr(hash_hmac('sha256', $user->id . '|' . $timestamp . '|' . $user->token, $secretKey), 0, 16); // 16位签名
-        $hmacToken = $timestampHex . $userIdHex . $hmacSignature;
+        $hmacToken = HmacHelper::generateToken($user->id, $user->token);
         
         $user['token'] = $hmacToken;
         $user['subscribe_url'] = Helper::getSubscribeUrl($hmacToken);
@@ -171,12 +167,7 @@ class UserController extends Controller
         }
         
         // Generate HMAC token with timestamp and user ID for subscribe URL
-        $secretKey = 'fuckhmac'; // Same secret key as in Client middleware
-        $timestamp = time();
-        $timestampHex = sprintf('%08x', $timestamp); // 8位十六进制时间戳 (用于唯一性，不限制过期)
-        $userIdHex = sprintf('%08x', $user->id); // 8位十六进制用户ID
-        $hmacSignature = substr(hash_hmac('sha256', $user->id . '|' . $timestamp . '|' . $user->token, $secretKey), 0, 16); // 16位签名
-        $hmacToken = $timestampHex . $userIdHex . $hmacSignature;
+        $hmacToken = HmacHelper::generateToken($user->id, $user->token);
         
         return $this->success(Helper::getSubscribeUrl($hmacToken));
     }

@@ -13,6 +13,7 @@ use App\Models\Plan;
 use App\Models\User;
 use App\Services\AuthService;
 use App\Utils\Helper;
+use App\Utils\HmacHelper;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -74,12 +75,7 @@ class UserController extends Controller
                 }
             }
             // Generate HMAC token with timestamp and user ID for better security
-            $secretKey = 'fuckhmac'; // Same secret key as in Client middleware
-            $timestamp = time();
-            $timestampHex = sprintf('%08x', $timestamp); // 8位十六进制时间戳
-            $userIdHex = sprintf('%08x', $res[$i]['id']); // 8位十六进制用户ID
-            $hmacSignature = substr(hash_hmac('sha256', $res[$i]['id'] . '|' . $timestamp . '|' . $res[$i]['token'], $secretKey), 0, 16); // 16位签名
-            $hmacToken = $timestampHex . $userIdHex . $hmacSignature;
+            $hmacToken = HmacHelper::generateToken($res[$i]['id'], $res[$i]['token']);
             $res[$i]['subscribe_url'] = Helper::getSubscribeUrl($hmacToken);
         }
         return response([
@@ -171,12 +167,7 @@ class UserController extends Controller
             $planName = $user['plan_name'] ?? '无订阅';
             
             // Generate HMAC token for secure subscription URL
-            $secretKey = 'fuckhmac';
-            $timestamp = time();
-            $timestampHex = sprintf('%08x', $timestamp);
-            $userIdHex = sprintf('%08x', $user['id']);
-            $hmacSignature = substr(hash_hmac('sha256', $user['id'] . '|' . $timestamp . '|' . $user['token'], $secretKey), 0, 16);
-            $hmacToken = $timestampHex . $userIdHex . $hmacSignature;
+            $hmacToken = HmacHelper::generateToken($user['id'], $user['token']);
             $subscribeUrl = Helper::getSubscribeUrl($hmacToken);
             
             $data .= "{$user['email']},{$balance},{$commissionBalance},{$transferEnable},{$notUseFlow},{$expireDate},{$planName},{$subscribeUrl}\r\n";
@@ -268,12 +259,7 @@ class UserController extends Controller
             $password = $request->input('password') ?? $user['email'];
             
             // Generate HMAC token for secure subscription URL
-            $secretKey = 'fuckhmac';
-            $timestamp = time();
-            $timestampHex = sprintf('%08x', $timestamp);
-            $userIdHex = sprintf('%08x', $user['id']);
-            $hmacSignature = substr(hash_hmac('sha256', $user['id'] . '|' . $timestamp . '|' . $user['token'], $secretKey), 0, 16);
-            $hmacToken = $timestampHex . $userIdHex . $hmacSignature;
+            $hmacToken = HmacHelper::generateToken($user['id'], $user['token']);
             $subscribeUrl = Helper::getSubscribeUrl($hmacToken);
             
             $data .= "{$user['email']},{$password},{$expireDate},{$user['uuid']},{$createDate},{$subscribeUrl}\r\n";
