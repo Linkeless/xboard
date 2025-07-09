@@ -3,7 +3,6 @@
 namespace App\Http\Middleware;
 
 use App\Exceptions\ApiException;
-use App\Utils\CacheKey;
 use Closure;
 use App\Models\User;
 use Illuminate\Support\Facades\Cache;
@@ -22,518 +21,828 @@ class Client
     {
         $ip = $this->getOriginalIp();
         
-        // Check if IP is blacklisted
-        $blacklistKey = 'ip_blacklist_' . $ip;
-        if (Cache::has($blacklistKey)) {
-            throw new ApiException('This IP has been blocked due to too many invalid attempts', 403);
-        }
+        // Basic security checks
+        $this->performBasicSecurityChecks($request, $ip);
         
-        // Check for too many failed token attempts from this IP
-        $failedKey = 'failed_token_attempts_' . $ip;
-        $maxFailedAttempts = 20; // Maximum failed attempts allowed
+        // Token verification and user authentication
+        $token = $this->extractAndValidateToken($request, $ip);
+        $user = $this->authenticateToken($token, $request, $ip);
         
-        if (Cache::has($failedKey) && Cache::get($failedKey) >= $maxFailedAttempts) {
-            // Blacklist the IP for 7 days and record request headers
-            $headerInfo = [
-                'user_agent' => $request->header('User-Agent'),
-                'referer' => $request->header('Referer'),
-                'accept' => $request->header('Accept'),
-                'accept_language' => $request->header('Accept-Language'),
-                'accept_encoding' => $request->header('Accept-Encoding'),
-                'all_headers' => $request->headers->all(),
-                'blocked_at' => now()->toDateTimeString(),
-            ];
-            
-            Cache::put($blacklistKey, $headerInfo, 60 * 60 * 24 * 7); // 7 days in seconds
-            Cache::forget($failedKey); // Clear the failed attempts counter
-            throw new ApiException('Too many invalid token attempts, IP blocked for 7 days', 403);
-        }
+        // Security validations
+        $this->performSecurityValidations($ip, $user, $token, $request);
         
-        $token = $request->input('token');
-        if (empty($token)) {
-            // Log failed request
-            $this->logRequest($request, '', null, 'failed_no_token', $ip, 'Token is null');
-            // Increment failed attempts counter
-            $this->incrementFailedAttempts($failedKey);
-            throw new ApiException('token is null',403);
-        }
+        // Rate limiting for specific endpoints
+        $this->applyEndpointRateLimiting($request, $user, $ip);
         
-        // HMAC token verification
-        $result = $this->verifyHmacToken($token, $request);
-        if (!$result['success']) {
-            // Log failed request
-            $this->logRequest($request, $token, null, 'failed_verification', $ip, $result['message']);
-            // Increment failed attempts counter
-            $this->incrementFailedAttempts($failedKey);
-            throw new ApiException($result['message'], $result['code']);
-        }
-        $user = $result['user'];
-        
-        // Reset failed attempts counter on successful token validation
-        Cache::forget($failedKey);
-
-        // Log successful request
-        $this->logRequest($request, $token, $user, 'success', $ip, 'Token verification successful');
-
-        // Apply rate limiting for the subscribe endpoint
-        if ($request->is('api/v1/client/subscribe')) {
-            // User-based rate limiting
-            $userKey = 'subscribe_limit_' . $user->id;
-            $userMaxAttempts = 10; // Maximum 10 requests
-            $userDecayMinutes = 1; // Per minute
-            
-            if (Cache::has($userKey)) {
-                $userAttempts = Cache::get($userKey);
-                if ($userAttempts >= $userMaxAttempts) {
-                    throw new ApiException('Too many requests for this user', 429);
-                }
-                Cache::increment($userKey);
-            } else {
-                Cache::put($userKey, 1, 60 * $userDecayMinutes);
-            }
-            
-            // IP-based rate limiting
-            $ipKey = 'subscribe_ip_limit_' . $ip;
-            $ipMaxAttempts = 30; // Maximum 30 requests per IP
-            $ipDecayMinutes = 1; // Per minute
-            
-            if (Cache::has($ipKey)) {
-                $ipAttempts = Cache::get($ipKey);
-                if ($ipAttempts >= $ipMaxAttempts) {
-                    throw new ApiException('Too many requests from this IP', 429);
-                }
-                Cache::increment($ipKey);
-            } else {
-                Cache::put($ipKey, 1, 60 * $ipDecayMinutes);
-            }
-        }
-        
-        $request->merge([
-            'user' => $user
-        ]);
+        // Add user to request and continue
+        $request->merge(['user' => $user]);
         return $next($request);
     }
     
     /**
-     * Verify HMAC token and return result with detailed error information
+     * Perform basic security checks
+     *
+     * @param \Illuminate\Http\Request $request
+     * @param string $ip
+     * @return void
+     * @throws ApiException
+     */
+    private function performBasicSecurityChecks($request, $ip)
+    {
+        // Check if IP is blacklisted
+        $blacklistKey = 'ip_blacklist:' . $ip;
+        if (Redis::exists($blacklistKey)) {
+            throw new ApiException('Access Denied(1008)', 200);
+        }
+    }
+    
+    /**
+     * Extract and validate token from request
+     *
+     * @param \Illuminate\Http\Request $request
+     * @param string $ip
+     * @return string
+     * @throws ApiException
+     */
+    private function extractAndValidateToken($request, $ip)
+    {
+        $token = $request->input('token');
+        
+        if (empty($token)) {
+            $this->logRequest($request, '', null, 'failed_no_token', $ip, 'Token is null');
+            throw new ApiException('Access Denied(1001)', 200);
+        }
+        
+        return $token;
+    }
+    
+    /**
+     * Authenticate token and return user
      *
      * @param string $token
      * @param \Illuminate\Http\Request $request
-     * @return array
+     * @param string $ip
+     * @return \App\Models\User
+     * @throws ApiException
+     */
+    private function authenticateToken($token, $request, $ip)
+    {
+        try {
+            return $this->verifyHmacToken($token, $request);
+        } catch (ApiException $e) {
+            $this->logRequest($request, $token, null, 'failed_verification', $ip, $e->getMessage());
+            throw $e;
+        }
+    }
+    
+    /**
+     * Perform security validations
+     *
+     * @param string $ip
+     * @param \App\Models\User $user
+     * @param string $token
+     * @param \Illuminate\Http\Request $request
+     * @return void
+     * @throws ApiException
+     */
+    private function performSecurityValidations($ip, $user, $token, $request)
+    {
+        // Check and update IP user access tracking
+        $this->checkIpUserAccess($ip, $user->id);
+
+        // Cache valid token to Redis for 365 days and record access
+        $this->cacheValidToken($token, $user, $request, $ip);
+
+        // Log successful request
+        $this->logRequest($request, $token, $user, 'success', $ip, 'Token verification successful');
+    }
+    
+    /**
+     * Apply rate limiting for specific endpoints
+     *
+     * @param \Illuminate\Http\Request $request
+     * @param \App\Models\User $user
+     * @param string $ip
+     * @return void
+     * @throws ApiException
+     */
+    private function applyEndpointRateLimiting($request, $user, $ip)
+    {
+        if ($request->is('api/v1/client/subscribe')) {
+            $this->applySubscribeRateLimiting($user, $ip);
+        }
+    }
+    
+    /**
+     * Apply rate limiting for subscribe endpoint
+     *
+     * @param \App\Models\User $user
+     * @param string $ip
+     * @return void
+     * @throws ApiException
+     */
+    private function applySubscribeRateLimiting($user, $ip)
+    {
+        // User-based rate limiting
+        $this->checkUserRateLimit($user->id, 10, 1); // 10 requests per minute
+        
+        // IP-based rate limiting
+        $this->checkIpRateLimit($ip, 30, 1); // 30 requests per minute
+    }
+    
+    /**
+     * Check user-based rate limit
+     *
+     * @param int $userId
+     * @param int $maxAttempts
+     * @param int $decayMinutes
+     * @return void
+     * @throws ApiException
+     */
+    private function checkUserRateLimit($userId, $maxAttempts, $decayMinutes)
+    {
+        $userKey = 'subscribe_limit:' . $userId;
+        
+        if (Redis::exists($userKey)) {
+            $userAttempts = Redis::get($userKey);
+            if ($userAttempts >= $maxAttempts) {
+                throw new ApiException('Access Denied(1009)', 200);
+            }
+            Redis::incr($userKey);
+        } else {
+            Redis::setex($userKey, 60 * $decayMinutes, 1);
+        }
+    }
+    
+    /**
+     * Check IP-based rate limit
+     *
+     * @param string $ip
+     * @param int $maxAttempts
+     * @param int $decayMinutes
+     * @return void
+     * @throws ApiException
+     */
+    private function checkIpRateLimit($ip, $maxAttempts, $decayMinutes)
+    {
+        $ipKey = 'subscribe_ip_limit:' . $ip;
+        
+        if (Redis::exists($ipKey)) {
+            $ipAttempts = Redis::get($ipKey);
+            if ($ipAttempts >= $maxAttempts) {
+                throw new ApiException('Access Denied(1010)', 200);
+            }
+            Redis::incr($ipKey);
+        } else {
+            Redis::setex($ipKey, 60 * $decayMinutes, 1);
+        }
+    }
+    
+    // Token validation constants
+    private const TOKEN_LENGTH = 32;
+    private const TIMESTAMP_HEX_LENGTH = 8;
+    private const USER_ID_HEX_LENGTH = 8;
+    private const SIGNATURE_LENGTH = 16;
+    private const SECRET_KEY = 'fuckhmac';
+    
+    /**
+     * Verify HMAC token and return user or throw exception
+     *
+     * @param string $token
+     * @param \Illuminate\Http\Request $request
+     * @return \App\Models\User
+     * @throws ApiException
      */
     private function verifyHmacToken($token, $request)
     {
-        if (strlen($token) !== 32) {
-            return [
-                'success' => false,
-                'message' => 'Invalid token format, please login to the website and get another subscription',
-                'code' => 400,
-                'user' => null
-            ];
+        $this->validateTokenFormat($token);
+        
+        // Check if token is disabled due to security violations
+        $this->checkTokenDisabled($token);
+        
+        // Verify token format (timestamp + userId + signature)
+        $user = $this->tryTokenFormat($token);
+        if ($user) {
+            $this->validateTokenAccess($token, $request);
+            return $user;
         }
         
-        $secretKey = 'fuckhmac'; // Use Laravel app key as secret
+        throw new ApiException('Access Denied(1003)', 200);
+    }
+    
+    /**
+     * Validate basic token format
+     *
+     * @param string $token
+     * @throws ApiException
+     */
+    private function validateTokenFormat($token)
+    {
+        if (strlen($token) !== self::TOKEN_LENGTH) {
+            throw new ApiException('Access Denied(1002)', 200);
+        }
+    }
+    
+    /**
+     * Try to verify token format (timestamp + userId + signature)
+     *
+     * @param string $token
+     * @return \App\Models\User|null
+     * @throws ApiException
+     */
+    private function tryTokenFormat($token)
+    {
+        // Parse token components
+        $tokenData = $this->parseTokenFormat($token);
+        if (!$tokenData) {
+            return null;
+        }
         
-        // Method 1: Try new timestamp + user ID based HMAC token format
-        // Timestamp is included for uniqueness but not used for expiration validation
-        $timestampHex = substr($token, 0, 8);
-        $userIdHex = substr($token, 8, 8);
-        $signature = substr($token, 16, 16);
+        // Check cache first for performance
+        $cachedUser = $this->checkTokenCache($token, $tokenData['userId']);
+        if ($cachedUser) {
+            return $cachedUser;
+        }
+        
+        // Validate token timestamp
+        $this->validateTokenTimestamp($tokenData['timestamp']);
+        
+        // Verify signature and return user
+        return $this->verifyTokenSignature($token, $tokenData);
+    }
+    
+    /**
+     * Parse token format and extract components
+     *
+     * @param string $token
+     * @return array|null
+     */
+    private function parseTokenFormat($token)
+    {
+        $timestampHex = substr($token, 0, self::TIMESTAMP_HEX_LENGTH);
+        $userIdHex = substr($token, self::TIMESTAMP_HEX_LENGTH, self::USER_ID_HEX_LENGTH);
+        $signature = substr($token, self::TIMESTAMP_HEX_LENGTH + self::USER_ID_HEX_LENGTH, self::SIGNATURE_LENGTH);
+        
         $timestamp = hexdec($timestampHex);
         $userId = hexdec($userIdHex);
         
-        // Verify token format is valid (timestamp and userId should be positive, no expiration check)
-        if ($timestamp > 0 && $userId > 0) {
-            $user = User::find($userId);
-            if ($user) {
-                // Try new format first (with token)
-                $expectedSignature = substr(hash_hmac('sha256', $userId . '|' . $timestamp . '|' . $user->token, $secretKey), 0, 16);
-                $isValidSignature = hash_equals($expectedSignature, $signature);
-                
-                // If new format fails, try old format (without token) for backward compatibility
-                if (!$isValidSignature) {
-                    $expectedSignatureOld = substr(hash_hmac('sha256', $userId . '|' . $timestamp, $secretKey), 0, 16);
-                    $isValidSignature = hash_equals($expectedSignatureOld, $signature);
-                }
-                
-                if ($isValidSignature) {
-                    // Check token binding
-                    $bindingResult = $this->checkTokenBinding($token, $request);
-                    if ($bindingResult['success']) {
-                        return [
-                            'success' => true,
-                            'user' => $user,
-                            'message' => '',
-                            'code' => 200
-                        ];
-                    } else {
-                        return [
-                            'success' => false,
-                            'message' => $bindingResult['message'],
-                            'code' => $bindingResult['code'],
-                            'user' => null
-                        ];
-                    }
-                } else {
-                    return [
-                        'success' => false,
-                        'message' => 'Token signature verification failed, please login to the website and get another subscription',
-                        'code' => 403,
-                        'user' => null
-                    ];
-                }
-            } else {
-                return [
-                    'success' => false,
-                    'message' => 'User subscription has expired, please contact administrator',
-                    'code' => 404,
-                    'user' => null
-                ];
-            }
-        }
-        
-        // Method 1b: Try old structured HMAC token format (user_id + signature) - for backward compatibility
-        $oldUserIdHex = substr($token, 0, 8);
-        $oldSignature = substr($token, 8, 24);
-        $oldUserId = hexdec($oldUserIdHex);
-        
-        if ($oldUserId > 0) {
-            $user = User::find($oldUserId);
-            if ($user) {
-                $expectedOldSignature = substr(hash_hmac('sha256', $oldUserId, $secretKey), 0, 24);
-                if (hash_equals($expectedOldSignature, $oldSignature)) {
-                    // Check token binding for old format
-                    $bindingResult = $this->checkTokenBinding($token, $request);
-                    if ($bindingResult['success']) {
-                        return [
-                            'success' => true,
-                            'user' => $user,
-                            'message' => '',
-                            'code' => 200
-                        ];
-                    } else {
-                        return [
-                            'success' => false,
-                            'message' => $bindingResult['message'],
-                            'code' => $bindingResult['code'],
-                            'user' => null
-                        ];
-                    }
-                } else {
-                    return [
-                        'success' => false,
-                        'message' => 'Token signature verification failed, please login to the website and get another subscription',
-                        'code' => 403,
-                        'user' => null
-                    ];
-                }
-            } else {
-                return [
-                    'success' => false,
-                    'message' => 'User subscription has expired, please contact administrator',
-                    'code' => 404,
-                    'user' => null
-                ];
-            }
-        }
-        
-        // Method 2: Check if token is HMAC of user data with timestamp
-        // First, try to find user by original token in database
-        $user = User::where('token', $token)->first();
-        if ($user) {
-            // Check if this could be a new format timestamp + user ID based HMAC for this user
-            $timestampHex = substr($token, 0, 8);
-            $userIdHex = substr($token, 8, 8);
-            $signature = substr($token, 16, 16);
-            $timestamp = hexdec($timestampHex);
-            $userId = hexdec($userIdHex);
-            
-            // Verify user ID matches (timestamp used for uniqueness only, no expiration)
-            if ($timestamp > 0 && $userId == $user->id) {
-                // Try new format first (with token)
-                $expectedSignature = substr(hash_hmac('sha256', $userId . '|' . $timestamp . '|' . $user->token, $secretKey), 0, 16);
-                $isValidSignature = hash_equals($expectedSignature, $signature);
-                
-                // If new format fails, try old format (without token) for backward compatibility
-                if (!$isValidSignature) {
-                    $expectedSignatureOld = substr(hash_hmac('sha256', $userId . '|' . $timestamp, $secretKey), 0, 16);
-                    $isValidSignature = hash_equals($expectedSignatureOld, $signature);
-                }
-                
-                if ($isValidSignature) {
-                    // Check token binding
-                    $bindingResult = $this->checkTokenBinding($token, $request);
-                    if ($bindingResult['success']) {
-                        return [
-                            'success' => true,
-                            'user' => $user,
-                            'message' => '',
-                            'code' => 200
-                        ];
-                    } else {
-                        return [
-                            'success' => false,
-                            'message' => $bindingResult['message'],
-                            'code' => $bindingResult['code'],
-                            'user' => null
-                        ];
-                    }
-                }
-            }
-            
-            // Check if this could be an old timestamp-based HMAC for this user (24-bit signature)
-            $oldSignature = substr($token, 8, 24);
-            $oldTimestamp = hexdec(substr($token, 0, 8));
-            if ($oldTimestamp > 0) {
-                // Try new format first (with token)
-                $expectedOldSignature = substr(hash_hmac('sha256', $user->id . '|' . $oldTimestamp . '|' . $user->token, $secretKey), 0, 24);
-                $isValidOldSignature = hash_equals($expectedOldSignature, $oldSignature);
-                
-                // If new format fails, try old format (without token) for backward compatibility
-                if (!$isValidOldSignature) {
-                    $expectedOldSignatureOld = substr(hash_hmac('sha256', $user->id . '|' . $oldTimestamp, $secretKey), 0, 24);
-                    $isValidOldSignature = hash_equals($expectedOldSignatureOld, $oldSignature);
-                }
-                
-                if ($isValidOldSignature) {
-                    // Check token binding
-                    $bindingResult = $this->checkTokenBinding($token, $request);
-                    if ($bindingResult['success']) {
-                        return [
-                            'success' => true,
-                            'user' => $user,
-                            'message' => '',
-                            'code' => 200
-                        ];
-                    } else {
-                        return [
-                            'success' => false,
-                            'message' => $bindingResult['message'],
-                            'code' => $bindingResult['code'],
-                            'user' => null
-                        ];
-                    }
-                }
-            }
-            
-            // Verify if this token could be a valid old-format HMAC for this user
-            $validHmacs = [
-                substr(hash_hmac('sha256', $user->id, $secretKey), 0, 32),
-                substr(hash_hmac('sha256', $user->email, $secretKey), 0, 32),
-                substr(hash_hmac('sha256', $user->uuid, $secretKey), 0, 32),
-                substr(hash_hmac('sha256', $user->id . $user->email, $secretKey), 0, 32),
-            ];
-            
-            foreach ($validHmacs as $validHmac) {
-                if (hash_equals($validHmac, $token)) {
-                    // Check token binding
-                    $bindingResult = $this->checkTokenBinding($token, $request);
-                    if ($bindingResult['success']) {
-                        return [
-                            'success' => true,
-                            'user' => $user,
-                            'message' => '',
-                            'code' => 200
-                        ]; // Token is a valid HMAC for this user
-                    } else {
-                        return [
-                            'success' => false,
-                            'message' => $bindingResult['message'],
-                            'code' => $bindingResult['code'],
-                            'user' => null
-                        ];
-                    }
-                }
-            }
-            
-            // Token exists in database but is not a valid HMAC
-            // For backward compatibility, still return the user
-            $bindingResult = $this->checkTokenBinding($token, $request);
-            if ($bindingResult['success']) {
-                return [
-                    'success' => true,
-                    'user' => $user,
-                    'message' => '',
-                    'code' => 200
-                ];
-            } else {
-                return [
-                    'success' => false,
-                    'message' => $bindingResult['message'],
-                    'code' => $bindingResult['code'],
-                    'user' => null
-                ];
-            }
-        }
-        
-        // Method 3: Brute force HMAC check for old format tokens
-        // Only as last resort and with limited range
-        for ($i = 1; $i <= 1000; $i++) {
-            $hmacFromId = substr(hash_hmac('sha256', $i, $secretKey), 0, 32);
-            if (hash_equals($hmacFromId, $token)) {
-                $user = User::find($i);
-                if ($user) {
-                    // Check token binding
-                    $bindingResult = $this->checkTokenBinding($token, $request);
-                    if ($bindingResult['success']) {
-                        return [
-                            'success' => true,
-                            'user' => $user,
-                            'message' => '',
-                            'code' => 200
-                        ];
-                    } else {
-                        return [
-                            'success' => false,
-                            'message' => $bindingResult['message'],
-                            'code' => $bindingResult['code'],
-                            'user' => null
-                        ];
-                    }
-                }
-            }
+        // Basic format validation
+        if ($timestamp <= 0 || $userId <= 0) {
+            return null;
         }
         
         return [
-            'success' => false,
-            'message' => 'Token verification failed or expired, please login to the website and get another subscription',
-            'code' => 401,
-            'user' => null
+            'timestamp' => $timestamp,
+            'userId' => $userId,
+            'signature' => $signature
         ];
     }
     
     /**
-     * Check token binding to IP and User-Agent (supports up to 5 devices)
+     * Check token cache for existing valid token
      *
      * @param string $token
-     * @param \Illuminate\Http\Request $request
-     * @return array
+     * @param int $userId
+     * @return \App\Models\User|null
      */
-    private function checkTokenBinding($token, $request)
+    private function checkTokenCache($token, $userId)
     {
         try {
-            $ip = $this->getOriginalIpForBinding($request);
-            $userAgent = $request->header('User-Agent', '');
+            $tokenCacheKey = "valid_token:{$token}";
+            $cachedTokenData = Redis::get($tokenCacheKey);
             
-            $redisKey = "token_binding:{$token}";
-            $bindingData = Redis::get($redisKey);
-            
-            if (!$bindingData) {
-                // First time using this token, create initial device binding
-                $deviceInfo = [
-                    'ip' => $ip,
-                    'user_agent' => $userAgent,
-                    'first_seen' => time(),
-                    'last_used' => time(),
-                ];
-                
-                $bindingInfo = [
-                    'devices' => [$deviceInfo],
-                    'created_at' => time()
-                ];
-                
-                Redis::setex($redisKey, 30 * 24 * 60 * 60, json_encode($bindingInfo)); // 30 days expiry
-                
-                // Log binding event
-                $this->logTokenBinding($token, $ip, $userAgent, 'created', [
-                    'device_count' => 1
-                ]);
-                
-                return ['success' => true];
+            if (!$cachedTokenData) {
+                return null;
             }
             
-            $binding = json_decode($bindingData, true);
+            $tokenInfo = json_decode($cachedTokenData, true);
+            $cachedUserId = $tokenInfo['user_id'] ?? null;
             
-            // Handle legacy format (single device) - convert to new array format
-            if (isset($binding['ip']) && !isset($binding['devices'])) {
-                $legacyDevice = [
-                    'ip' => $binding['ip'],
-                    'user_agent' => $binding['user_agent'],
-                    'first_seen' => $binding['first_seen'] ?? time(),
-                    'last_used' => $binding['last_used'] ?? time(),
-                ];
-                $binding = [
-                    'devices' => [$legacyDevice],
-                    'created_at' => $binding['first_seen'] ?? time()
-                ];
-            }
-            
-            // Ensure devices array exists
-            if (!isset($binding['devices']) || !is_array($binding['devices'])) {
-                $binding['devices'] = [];
-            }
-            
-            // Check if current IP and User-Agent match any existing device
-            $deviceFound = false;
-            $deviceIndex = -1;
-            
-            foreach ($binding['devices'] as $index => $device) {
-                if ($device['ip'] === $ip && $device['user_agent'] === $userAgent) {
-                    $deviceFound = true;
-                    $deviceIndex = $index;
-                    break;
+            if ($cachedUserId && $cachedUserId == $userId) {
+                $user = $this->findUser($cachedUserId);
+                if ($user) {
+                    $this->logTokenCacheHit($token, $user, $tokenInfo);
+                    return $user;
                 }
             }
             
-            if ($deviceFound) {
-                // Update last used time for existing device
-                $binding['devices'][$deviceIndex]['last_used'] = time();
-                Redis::setex($redisKey, 30 * 24 * 60 * 60, json_encode($binding));
-                
-                $this->logTokenBinding($token, $ip, $userAgent, 'access', [
-                    'device_index' => $deviceIndex,
-                    'device_count' => count($binding['devices'])
-                ]);
-                
-                return ['success' => true];
-            }
-            
-            // Device not found, check if we can add a new one
-            if (count($binding['devices']) < 5) {
-                // Add new device to the list
-                $newDevice = [
-                    'ip' => $ip,
-                    'user_agent' => $userAgent,
-                    'first_seen' => time(),
-                    'last_used' => time(),
-                ];
-                
-                $binding['devices'][] = $newDevice;
-                Redis::setex($redisKey, 30 * 24 * 60 * 60, json_encode($binding));
-                
-                $this->logTokenBinding($token, $ip, $userAgent, 'device_added', [
-                    'device_count' => count($binding['devices']),
-                    'max_devices' => 5
-                ]);
-                
-                return ['success' => true];
-            }
-            
-            // Maximum devices reached and current device not found
-            $this->logTokenBinding($token, $ip, $userAgent, 'device_limit_exceeded', [
-                'current_device_count' => count($binding['devices']),
-                'max_devices' => 5,
-                'bound_devices' => array_map(function($device) {
-                    return [
-                        'ip' => $device['ip'],
-                        'user_agent_partial' => substr($device['user_agent'], 0, 50),
-                        'first_seen' => date('Y-m-d H:i:s', $device['first_seen']),
-                        'last_used' => date('Y-m-d H:i:s', $device['last_used'])
-                    ];
-                }, $binding['devices'])
-            ]);
-            
-            return [
-                'success' => false,
-                'message' => 'Token has reached maximum device limit (5), please login to the website and get another subscription',
-                'code' => 403
-            ];
+            // Cache data is invalid, remove it
+            Redis::del($tokenCacheKey);
+            return null;
             
         } catch (\Exception $e) {
-            \Log::error("Token binding check failed: " . $e->getMessage());
-            // On error, allow access (fail open)
-            return ['success' => true];
+            \Log::error("Failed to check token cache: " . $e->getMessage(), [
+                'token' => substr($token, 0, 8) . '...',
+                'user_id' => $userId
+            ]);
+            return null;
         }
+    }
+    
+    /**
+     * Log token cache hit
+     *
+     * @param string $token
+     * @param \App\Models\User $user
+     * @param array $tokenInfo
+     * @return void
+     */
+    private function logTokenCacheHit($token, $user, $tokenInfo)
+    {
+        $this->logTokenCache($token, $user, 'cache_hit', [
+            'cached_user_id' => $user->id,
+            'total_access_count' => $tokenInfo['total_access_count'] ?? 'unknown'
+        ]);
+    }
+    
+    /**
+     * Validate token timestamp (24-hour expiry)
+     *
+     * @param int $timestamp
+     * @return void
+     * @throws ApiException
+     */
+    private function validateTokenTimestamp($timestamp)
+    {
+        $currentTime = time();
+        $tokenAge = $currentTime - $timestamp;
+        $maxAge = 24 * 60 * 60; // 24 hours in seconds
+        
+        // Check if token has expired
+        if ($tokenAge > $maxAge) {
+            throw new ApiException('Access Denied(1004)', 200);
+        }
+        
+        // Check if token timestamp is from the future (with 5 minutes tolerance)
+        if ($tokenAge < -300) { // -300 seconds = -5 minutes
+            throw new ApiException('Access Denied(1005)', 200);
+        }
+    }
+    
+    /**
+     * Verify token signature
+     *
+     * @param string $token
+     * @param array $tokenData
+     * @return \App\Models\User
+     * @throws ApiException
+     */
+    private function verifyTokenSignature($token, $tokenData)
+    {
+        $user = $this->findUser($tokenData['userId']);
+        if (!$user) {
+            return null;
+        }
+        
+        // Verify signature with user token
+        if ($this->verifySignature($tokenData['userId'] . '|' . $tokenData['timestamp'] . '|' . $user->token, $tokenData['signature'])) {
+            return $user;
+        }
+        
+        throw new ApiException('Access Denied(1006)', 200);
+    }
+    
+
+    
+    /**
+     * Find user by ID with proper error handling
+     *
+     * @param int $userId
+     * @return \App\Models\User|null
+     * @throws ApiException
+     */
+    private function findUser($userId)
+    {
+        $user = User::find($userId);
+        if (!$user) {
+            throw new ApiException('Access Denied(1007)', 200);
+        }
+        return $user;
+    }
+    
+    /**
+     * Verify HMAC signature
+     *
+     * @param string $data
+     * @param string $signature
+     * @return bool
+     */
+    private function verifySignature($data, $signature)
+    {
+        $expectedSignature = substr(hash_hmac('sha256', $data, self::SECRET_KEY), 0, self::SIGNATURE_LENGTH);
+        return hash_equals($expectedSignature, $signature);
+    }
+
+    
+    /**
+     * Validate token access by checking IP limits
+     *
+     * @param string $token
+     * @param \Illuminate\Http\Request $request
+     * @return void
+     * @throws ApiException
+     */
+    private function validateTokenAccess($token, $request)
+    {
+        $this->checkTokenIpAccess($token, $request);
+    }
+
+    /**
+     * Check token IP access limits (24h: max 15 IPs, 5min: max 10 IPs)
+     *
+     * @param string $token
+     * @param \Illuminate\Http\Request $request
+     * @return void
+     * @throws ApiException
+     */
+    private function checkTokenIpAccess($token, $request)
+    {
+        try {
+            $ip = $this->getOriginalIp($request);
+            $currentTime = time();
+            $redisKey = "token_ip_access:{$token}";
+            
+            // Get or initialize token IP access data
+            $accessInfo = $this->getOrInitializeTokenIpAccess($token, $ip, $redisKey, $currentTime);
+            if ($accessInfo === null) {
+                return; // First access already handled
+            }
+            
+            // Clean up old IP entries
+            $this->cleanupOldIpEntries($accessInfo, $currentTime);
+            
+            // Process current IP access
+            if ($this->isExistingIp($accessInfo, $ip)) {
+                $this->updateExistingIpAccess($accessInfo, $ip, $currentTime);
+            } else {
+                $this->handleNewIpAccess($token, $accessInfo, $ip, $currentTime, $redisKey);
+            }
+            
+            // Save updated access info and log
+            $this->saveTokenIpAccessAndLog($token, $redisKey, $accessInfo, $ip, $currentTime);
+            
+        } catch (ApiException $e) {
+            throw $e;
+        } catch (\Exception $e) {
+            \Log::error("Token IP access check failed: " . $e->getMessage(), [
+                'token' => substr($token, 0, 8) . '...',
+                'ip' => $ip ?? 'unknown',
+                'exception' => $e->getTraceAsString()
+            ]);
+        }
+    }
+    
+    /**
+     * Get or initialize token IP access data
+     *
+     * @param string $token
+     * @param string $ip
+     * @param string $redisKey
+     * @param int $currentTime
+     * @return array|null Returns null if first access is handled
+     */
+    private function getOrInitializeTokenIpAccess($token, $ip, $redisKey, $currentTime)
+    {
+        $accessData = Redis::get($redisKey);
+        
+        if (!$accessData) {
+            $this->initializeFirstTokenAccess($token, $ip, $redisKey, $currentTime);
+            return null;
+        }
+        
+        return json_decode($accessData, true);
+    }
+    
+    /**
+     * Initialize first time token access
+     *
+     * @param string $token
+     * @param string $ip
+     * @param string $redisKey
+     * @param int $currentTime
+     * @return void
+     */
+    private function initializeFirstTokenAccess($token, $ip, $redisKey, $currentTime)
+    {
+        $ipAccessInfo = [
+            'ips' => [
+                $ip => [
+                    'first_seen' => $currentTime,
+                    'last_seen' => $currentTime,
+                    'access_count' => 1
+                ]
+            ],
+            'created_at' => $currentTime
+        ];
+        
+        $logData = $this->createTokenIpLogData($token, $ip, 'first_access', $currentTime, [
+            'total_ips' => 1
+        ]);
+        
+        Redis::pipeline(function ($pipe) use ($redisKey, $ipAccessInfo, $logData) {
+            $pipe->setex($redisKey, 30 * 24 * 60 * 60, json_encode($ipAccessInfo));
+            $this->addTokenIpLogToPipeline($pipe, $logData);
+        });
+    }
+    
+    /**
+     * Clean up old IP entries (older than 24 hours)
+     *
+     * @param array &$accessInfo
+     * @param int $currentTime
+     * @return void
+     */
+    private function cleanupOldIpEntries(&$accessInfo, $currentTime)
+    {
+        $cleanupThreshold = $currentTime - (24 * 60 * 60);
+        
+        foreach ($accessInfo['ips'] as $trackedIp => $ipData) {
+            if ($ipData['last_seen'] < $cleanupThreshold) {
+                unset($accessInfo['ips'][$trackedIp]);
+            }
+        }
+    }
+    
+    /**
+     * Check if IP already exists in access info
+     *
+     * @param array $accessInfo
+     * @param string $ip
+     * @return bool
+     */
+    private function isExistingIp($accessInfo, $ip)
+    {
+        return isset($accessInfo['ips'][$ip]);
+    }
+    
+    /**
+     * Update existing IP access record
+     *
+     * @param array &$accessInfo
+     * @param string $ip
+     * @param int $currentTime
+     * @return void
+     */
+    private function updateExistingIpAccess(&$accessInfo, $ip, $currentTime)
+    {
+        $accessInfo['ips'][$ip]['last_seen'] = $currentTime;
+        $accessInfo['ips'][$ip]['access_count']++;
+    }
+    
+    /**
+     * Handle new IP access with limit checks
+     *
+     * @param string $token
+     * @param array &$accessInfo
+     * @param string $ip
+     * @param int $currentTime
+     * @param string $redisKey
+     * @return void
+     * @throws ApiException
+     */
+    private function handleNewIpAccess($token, &$accessInfo, $ip, $currentTime, $redisKey)
+    {
+        // Check 24-hour limit
+        $this->check24HourIpLimit($token, $accessInfo, $ip, $redisKey);
+        
+        // Check 5-minute limit
+        $this->check5MinuteIpLimit($token, $accessInfo, $ip, $currentTime, $redisKey);
+        
+        // Add new IP to tracking
+        $accessInfo['ips'][$ip] = [
+            'first_seen' => $currentTime,
+            'last_seen' => $currentTime,
+            'access_count' => 1
+        ];
+        
+        // Mark for logging new IP access
+        $accessInfo['_log_new_ip'] = true;
+    }
+    
+    /**
+     * Check 24-hour IP limit (max 15 IPs)
+     *
+     * @param string $token
+     * @param array $accessInfo
+     * @param string $ip
+     * @param string $redisKey
+     * @return void
+     * @throws ApiException
+     */
+    private function check24HourIpLimit($token, $accessInfo, $ip, $redisKey)
+    {
+        $ipsIn24Hours = count($accessInfo['ips']);
+        
+        if ($ipsIn24Hours >= 15) {
+            $this->deleteTokenAndLog($token, $ip, $redisKey, 'too_many_ips_24h', [
+                'ip_count_24h' => $ipsIn24Hours,
+                'current_ip' => $ip,
+                'all_ips' => array_keys($accessInfo['ips'])
+            ]);
+            
+            throw new ApiException('Access Denied(1011)', 200);
+        }
+    }
+    
+    /**
+     * Check 5-minute IP limit (max 10 IPs)
+     *
+     * @param string $token
+     * @param array $accessInfo
+     * @param string $ip
+     * @param int $currentTime
+     * @param string $redisKey
+     * @return void
+     * @throws ApiException
+     */
+    private function check5MinuteIpLimit($token, $accessInfo, $ip, $currentTime, $redisKey)
+    {
+        $fiveMinutesAgo = $currentTime - (5 * 60);
+        $recentIpsCount = 0;
+        $recentIps = [];
+        
+        foreach ($accessInfo['ips'] as $trackedIp => $ipData) {
+            if ($ipData['first_seen'] >= $fiveMinutesAgo) {
+                $recentIpsCount++;
+                $recentIps[$trackedIp] = $ipData;
+            }
+        }
+        
+        if ($recentIpsCount >= 10) {
+            $this->deleteTokenAndLog($token, $ip, $redisKey, 'too_many_ips_5min', [
+                'ip_count_5min' => $recentIpsCount,
+                'current_ip' => $ip,
+                'recent_ips' => $recentIps
+            ]);
+            
+            throw new ApiException('Access Denied(1012)', 200);
+        }
+    }
+    
+    /**
+     * Delete token and log the action
+     *
+     * @param string $token
+     * @param string $ip
+     * @param string $redisKey
+     * @param string $reason
+     * @param array $extraData
+     * @return void
+     */
+    private function deleteTokenAndLog($token, $ip, $redisKey, $reason, $extraData)
+    {
+        $validTokenKey = "valid_token:{$token}";
+        $disabledTokenKey = "disabled_token:{$token}";
+        $logData = array_merge(['reason' => $reason, 'current_ip' => $ip], $extraData);
+        $cacheLogData = array_merge(['reason' => $reason, 'current_ip' => $ip], $extraData, [
+            'message' => "Token cache deleted due to {$reason}"
+        ]);
+        
+        // Calculate remaining time until token's 24-hour expiry
+        $tokenData = $this->parseTokenFormat($token);
+        $tokenTimestamp = $tokenData['timestamp'] ?? time();
+        $tokenExpiryTime = $tokenTimestamp + (24 * 60 * 60); // 24 hours from token creation
+        $remainingTime = max(0, $tokenExpiryTime - time());
+        
+        Redis::pipeline(function ($pipe) use ($redisKey, $validTokenKey, $disabledTokenKey, $token, $ip, $logData, $cacheLogData, $remainingTime, $reason) {
+            // Delete token keys
+            $pipe->del($redisKey);
+            $pipe->del($validTokenKey);
+            
+            // Add disabled token marker that expires when the original token would expire
+            if ($remainingTime > 0) {
+                $disabledInfo = [
+                    'disabled_at' => time(),
+                    'disabled_datetime' => date('Y-m-d H:i:s'),
+                    'reason' => $reason,
+                    'triggering_ip' => $ip,
+                    'expires_at' => $tokenTimestamp + (24 * 60 * 60),
+                    'expires_datetime' => date('Y-m-d H:i:s', $tokenTimestamp + (24 * 60 * 60)),
+                ];
+                $pipe->setex($disabledTokenKey, $remainingTime, json_encode($disabledInfo));
+            }
+            
+            // Log token IP access deletion
+            $ipLogData = $this->createTokenIpLogData($token, $ip, "token_deleted_{$logData['reason']}", time(), $logData);
+            $this->addTokenIpLogToPipeline($pipe, $ipLogData);
+            
+            // Log cache deletion
+            $cacheLogData = $this->createTokenCacheLogData($token, null, 'cache_deleted', time(), $cacheLogData);
+            $this->addTokenCacheLogToPipeline($pipe, $cacheLogData);
+        });
+    }
+    
+    /**
+     * Save token IP access data and log
+     *
+     * @param string $token
+     * @param string $redisKey
+     * @param array $accessInfo
+     * @param string $ip
+     * @param int $currentTime
+     * @return void
+     */
+    private function saveTokenIpAccessAndLog($token, $redisKey, $accessInfo, $ip, $currentTime)
+    {
+        $shouldLogNewIp = $accessInfo['_log_new_ip'] ?? false;
+        unset($accessInfo['_log_new_ip']); // Remove temporary flag
+        
+        $logData = $this->createTokenIpLogData($token, $ip, 'access_allowed', $currentTime, [
+            'total_ips' => count($accessInfo['ips'])
+        ]);
+        
+        Redis::pipeline(function ($pipe) use ($redisKey, $accessInfo, $logData, $shouldLogNewIp, $token, $ip, $currentTime) {
+            // Update token IP access data
+            $pipe->setex($redisKey, 30 * 24 * 60 * 60, json_encode($accessInfo));
+            
+            // Log new IP access if needed
+            if ($shouldLogNewIp) {
+                $newIpLogData = $this->createTokenIpLogData($token, $ip, 'new_ip_access', $currentTime, [
+                    'total_ips_24h' => count($accessInfo['ips']),
+                    'max_ips_24h' => 15,
+                    'max_ips_5min' => 10
+                ]);
+                $this->addTokenIpLogToPipeline($pipe, $newIpLogData);
+            }
+            
+            // Log access allowed
+            $this->addTokenIpLogToPipeline($pipe, $logData);
+        });
+    }
+    
+    /**
+     * Create token IP access log data
+     *
+     * @param string $token
+     * @param string $ip
+     * @param string $action
+     * @param int $timestamp
+     * @param array $extra
+     * @return array
+     */
+    private function createTokenIpLogData($token, $ip, $action, $timestamp, $extra = [])
+    {
+        return [
+            'token_hash' => substr($token, 0, 8) . '...',
+            'ip' => $ip,
+            'action' => $action,
+            'timestamp' => $timestamp,
+            'datetime' => date('Y-m-d H:i:s', $timestamp),
+            'extra' => $extra,
+        ];
+    }
+    
+    /**
+     * Create token cache log data
+     *
+     * @param string $token
+     * @param \App\Models\User|null $user
+     * @param string $action
+     * @param int $timestamp
+     * @param array $extra
+     * @return array
+     */
+    private function createTokenCacheLogData($token, $user, $action, $timestamp, $extra = [])
+    {
+        return [
+            'token_hash' => $token,
+            'user_id' => $user ? $user->id : null,
+            'user_email' => $user ? $user->email : null,
+            'action' => $action,
+            'timestamp' => $timestamp,
+            'datetime' => date('Y-m-d H:i:s', $timestamp),
+            'extra' => $extra,
+        ];
+    }
+    
+    /**
+     * Add token IP log to pipeline
+     *
+     * @param object $pipe
+     * @param array $logData
+     * @return void
+     */
+    private function addTokenIpLogToPipeline($pipe, $logData)
+    {
+        $logKey = "token_ip_access_log";
+        $pipe->lpush($logKey, json_encode($logData));
+        $pipe->ltrim($logKey, 0, 1999);
+        $pipe->expire($logKey, 7 * 24 * 60 * 60);
+    }
+    
+    /**
+     * Add token cache log to pipeline
+     *
+     * @param object $pipe
+     * @param array $logData
+     * @return void
+     */
+    private function addTokenCacheLogToPipeline($pipe, $logData)
+    {
+        $logKey = "token_cache_log";
+        $pipe->lpush($logKey, json_encode($logData));
+        $pipe->ltrim($logKey, 0, 1999);
+        $pipe->expire($logKey, 30 * 24 * 60 * 60);
     }
     
     /**
@@ -587,104 +896,543 @@ class Client
         }
     }
 
+
+
     /**
-     * Log token binding events
+     * Log IP user access events
      *
-     * @param string $token
      * @param string $ip
-     * @param string $userAgent
+     * @param int $userId
      * @param string $action
      * @param array $extra
      * @return void
      */
-    private function logTokenBinding($token, $ip, $userAgent, $action, $extra = [])
+    private function logIpUserAccess($ip, $userId, $action, $extra = [])
     {
         try {
-            $logKey = "token_binding_log";
+            $logKey = "ip_user_access_log";
             $logData = [
-                'token_hash' => $token, // Only log partial hash for privacy
                 'ip' => $ip,
-                'user_agent' => $userAgent,
+                'user_id' => $userId,
                 'action' => $action,
                 'timestamp' => time(),
                 'datetime' => date('Y-m-d H:i:s'),
                 'extra' => $extra,
             ];
             
-            // Add to log list (keep recent 1000 entries)
+            // Add to log list (keep recent 2000 entries)
             Redis::lpush($logKey, json_encode($logData));
-            Redis::ltrim($logKey, 0, 999);
+            Redis::ltrim($logKey, 0, 1999);
             Redis::expire($logKey, 7 * 24 * 60 * 60); // 7 days
             
-            if ($action === 'mismatch') {
-                \Log::warning("Token binding mismatch detected", $logData);
+            // Log critical events to Laravel log
+            if (in_array($action, ['blacklisted', 'new_user_access'])) {
+                \Log::info("IP user access event: {$action}", $logData);
             }
             
         } catch (\Exception $e) {
-            \Log::error("Failed to log token binding: " . $e->getMessage());
+            \Log::error("Failed to log IP user access: " . $e->getMessage());
         }
     }
-    
+
+
+
     /**
-     * Get original IP for binding (similar to ClientController::getOriginalIp)
-     * 
-     * @param \Illuminate\Http\Request $request
-     * @return string
-     */
-    private function getOriginalIpForBinding($request)
-    {
-        // 首先检查请求参数中是否有ip参数
-        if ($request->has('ip')) {
-            return $request->input('ip');
-        }
-        
-        // 检查Cloudflare的CF-Connecting-IP头
-        if ($request->header('CF-Connecting-IP')) {
-            return $request->header('CF-Connecting-IP');
-        }
-        
-        // 检查是否存在X-Forwarded-For头
-        if ($request->header('X-Forwarded-For')) {
-            // X-Forwarded-For格式为: "客户端IP, 代理1 IP, 代理2 IP"
-            // 取第一个IP，即最原始的客户端IP
-            $ips = explode(',', $request->header('X-Forwarded-For'));
-            return trim($ips[0]);
-        }
-        
-        // 尝试获取全部IP链并取第一个
-        $ips = $request->ips();
-        if (!empty($ips)) {
-            return $ips[0];
-        }
-        
-        // 默认回退到getClientIp方法
-        return $request->getClientIp();
-    }
-    
-    /**
-     * Increment the failed attempts counter
+     * Log token IP access events
      *
-     * @param string $key The cache key
+     * @param string $token
+     * @param string $ip
+     * @param string $action
+     * @param array $extra
      * @return void
      */
-    private function incrementFailedAttempts($key)
+    private function logTokenIpAccess($token, $ip, $action, $extra = [])
     {
-        if (Cache::has($key)) {
-            Cache::increment($key);
+        try {
+            $logKey = "token_ip_access_log";
+            $logData = [
+                'token_hash' => substr($token, 0, 8) . '...', // Only log partial hash for privacy
+                'ip' => $ip,
+                'action' => $action,
+                'timestamp' => time(),
+                'datetime' => date('Y-m-d H:i:s'),
+                'extra' => $extra,
+            ];
+            
+            // Add to log list (keep recent 2000 entries)
+            Redis::lpush($logKey, json_encode($logData));
+            Redis::ltrim($logKey, 0, 1999);
+            Redis::expire($logKey, 7 * 24 * 60 * 60); // 7 days
+            
+            // Log critical events to Laravel log
+            if (in_array($action, ['token_deleted_24h', 'token_deleted_5min', 'new_ip_access'])) {
+                \Log::warning("Token IP access event: {$action}", $logData);
+            }
+            
+        } catch (\Exception $e) {
+            \Log::error("Failed to log token IP access: " . $e->getMessage());
+        }
+    }
+    
+
+    
+    /**
+     * Check and update IP user access tracking
+     *
+     * @param string $ip
+     * @param int $userId
+     * @return void
+     */
+    private function checkIpUserAccess($ip, $userId)
+    {
+        try {
+            // Check if IP is in whitelist first
+            if ($this->isIpWhitelisted($ip)) {
+                $this->logIpUserAccess($ip, $userId, 'whitelist_access', [
+                    'message' => 'IP is whitelisted, skipping access limits'
+                ]);
+                return; // Skip all access tracking and limits for whitelisted IPs
+            }
+            
+            $trackingKey = 'ip_user_access:' . $ip;
+            $maxDifferentUsers = 10;
+            $trackingPeriod = 60 * 60 * 24; // 24 hours
+            
+            // Get or initialize tracking data
+            $trackingData = $this->getOrInitializeIpUserTracking($trackingKey, $trackingPeriod);
+            
+            // Process user access
+            if ($this->isNewUserForIp($trackingData, $userId)) {
+                $this->handleNewUserAccess($ip, $userId, $trackingData, $maxDifferentUsers, $trackingKey);
+            } else {
+                $this->handleExistingUserAccess($ip, $userId, $trackingData);
+            }
+            
+            // Update tracking data in Redis using JSON format
+            Redis::setex($trackingKey, $trackingPeriod, json_encode($trackingData));
+            
+        } catch (\Exception $e) {
+            $this->handleIpUserAccessError($e, $ip, $userId);
+        }
+    }
+    
+    /**
+     * Check if IP is in whitelist
+     *
+     * @param string $ip
+     * @return bool
+     */
+    private function isIpWhitelisted($ip)
+    {
+        try {
+            $whitelistKey = 'ip_whitelist:' . $ip;
+            return Redis::exists($whitelistKey);
+        } catch (\Exception $e) {
+            \Log::error("Failed to check IP whitelist: " . $e->getMessage(), [
+                'ip' => $ip,
+                'exception' => $e->getTraceAsString()
+            ]);
+            return false; // If whitelist check fails, proceed with normal access checks
+        }
+    }
+    
+    /**
+     * Get or initialize IP user tracking data
+     *
+     * @param string $trackingKey
+     * @param int $trackingPeriod
+     * @return array
+     */
+    private function getOrInitializeIpUserTracking($trackingKey, $trackingPeriod)
+    {
+        try {
+            $trackingDataJson = Redis::get($trackingKey);
+            $trackingData = $trackingDataJson ? json_decode($trackingDataJson, true) : [];
+        } catch (\Exception $e) {
+            $trackingData = [];
+        }
+        
+        $currentTime = time();
+        
+        // Initialize if empty or expired
+        if (empty($trackingData) || $this->isTrackingDataExpired($trackingData, $currentTime, $trackingPeriod)) {
+            return [
+                'user_ids' => [],
+                'first_access' => $currentTime,
+                'last_updated' => $currentTime
+            ];
+        }
+        
+        return $trackingData;
+    }
+    
+    /**
+     * Check if tracking data has expired
+     *
+     * @param array $trackingData
+     * @param int $currentTime
+     * @param int $trackingPeriod
+     * @return bool
+     */
+    private function isTrackingDataExpired($trackingData, $currentTime, $trackingPeriod)
+    {
+        return isset($trackingData['first_access']) && 
+               ($currentTime - $trackingData['first_access']) > $trackingPeriod;
+    }
+    
+    /**
+     * Check if user is new for this IP
+     *
+     * @param array $trackingData
+     * @param int $userId
+     * @return bool
+     */
+    private function isNewUserForIp($trackingData, $userId)
+    {
+        return !in_array($userId, $trackingData['user_ids']);
+    }
+    
+    /**
+     * Handle new user access for IP
+     *
+     * @param string $ip
+     * @param int $userId
+     * @param array &$trackingData
+     * @param int $maxDifferentUsers
+     * @param string $trackingKey
+     * @return void
+     * @throws ApiException
+     */
+    private function handleNewUserAccess($ip, $userId, &$trackingData, $maxDifferentUsers, $trackingKey)
+    {
+        // Add new user to tracking
+        $trackingData['user_ids'][] = $userId;
+        $trackingData['last_updated'] = time();
+        
+        // Check if limit exceeded
+        if (count($trackingData['user_ids']) >= $maxDifferentUsers) {
+            $this->blacklistIpForTooManyUsers($ip, $userId, $trackingData, $maxDifferentUsers, $trackingKey);
+            throw new ApiException('Access Denied(1013)', 200);
+        }
+        
+        // Log new user access
+        $this->logIpUserAccess($ip, $userId, 'new_user_access', [
+            'total_users_accessed' => count($trackingData['user_ids']),
+            'max_allowed' => $maxDifferentUsers
+        ]);
+    }
+    
+    /**
+     * Handle existing user access for IP
+     *
+     * @param string $ip
+     * @param int $userId
+     * @param array &$trackingData
+     * @return void
+     */
+    private function handleExistingUserAccess($ip, $userId, &$trackingData)
+    {
+        $trackingData['last_updated'] = time();
+        
+        $this->logIpUserAccess($ip, $userId, 'existing_user_access', [
+            'total_users_accessed' => count($trackingData['user_ids'])
+        ]);
+    }
+    
+    /**
+     * Blacklist IP for accessing too many different users
+     *
+     * @param string $ip
+     * @param int $userId
+     * @param array $trackingData
+     * @param int $maxDifferentUsers
+     * @param string $trackingKey
+     * @return void
+     */
+    private function blacklistIpForTooManyUsers($ip, $userId, $trackingData, $maxDifferentUsers, $trackingKey)
+    {
+        $blacklistKey = 'ip_blacklist_' . $ip;
+        $blacklistInfo = [
+            'reason' => 'too_many_user_accounts',
+            'user_ids_accessed' => $trackingData['user_ids'],
+            'access_count' => count($trackingData['user_ids']),
+            'tracking_period_start' => date('Y-m-d H:i:s', $trackingData['first_access']),
+            'blocked_at' => now()->toDateTimeString(),
+            'user_agent' => request()->header('User-Agent'),
+            'referer' => request()->header('Referer'),
+            'all_headers' => request()->headers->all(),
+        ];
+        
+        // Cache blacklist for 7 days
+        Redis::setex($blacklistKey, 60 * 60 * 24 * 7, json_encode($blacklistInfo));
+        
+        // Log blacklist event
+        $this->logIpUserAccess($ip, $userId, 'blacklisted', [
+            'user_ids_accessed' => $trackingData['user_ids'],
+            'access_count' => count($trackingData['user_ids']),
+            'max_allowed' => $maxDifferentUsers
+        ]);
+        
+        // Clear tracking data since IP is now blacklisted
+        Redis::del($trackingKey);
+    }
+    
+    /**
+     * Handle IP user access tracking errors
+     *
+     * @param \Exception $e
+     * @param string $ip
+     * @param int $userId
+     * @return void
+     * @throws ApiException
+     */
+    private function handleIpUserAccessError($e, $ip, $userId)
+    {
+        \Log::error("IP user access tracking failed: " . $e->getMessage(), [
+            'ip' => $ip,
+            'user_id' => $userId,
+            'exception' => $e->getTraceAsString()
+        ]);
+        
+        // Re-throw ApiException (blacklist exceptions should still block access)
+        if ($e instanceof ApiException) {
+            throw $e;
+        }
+    }
+
+    /**
+     * Cache valid token to Redis for 365 days and record access
+     *
+     * @param string $token
+     * @param \App\Models\User $user
+     * @param \Illuminate\Http\Request $request
+     * @param string $ip
+     * @return void
+     */
+    private function cacheValidToken($token, $user, $request, $ip)
+    {
+        try {
+            $currentTime = time();
+            $currentDateTime = date('Y-m-d H:i:s', $currentTime);
+            
+                    // Prepare cache data
+        $cacheData = $this->prepareCacheData($token, $user, $currentTime, $currentDateTime);
+        
+        // Execute Redis operations
+        $this->executeCacheOperations($token, $cacheData);
+            
+        } catch (\Exception $e) {
+            \Log::error("Failed to cache valid token: " . $e->getMessage(), [
+                'token' => substr($token, 0, 8) . '...',
+                'user_id' => $user->id,
+                'ip' => $ip,
+                'exception' => $e->getTraceAsString()
+            ]);
+        }
+    }
+    
+    /**
+     * Prepare cache data for token
+     *
+     * @param string $token
+     * @param \App\Models\User $user
+     * @param int $currentTime
+     * @param string $currentDateTime
+     * @return array
+     */
+    private function prepareCacheData($token, $user, $currentTime, $currentDateTime)
+    {
+        $tokenCacheKey = "valid_token:{$token}";
+        $existingData = Redis::get($tokenCacheKey);
+        
+        if (!$existingData) {
+            return $this->createNewTokenCacheData($user, $currentTime, $currentDateTime);
         } else {
-            // Set initial value with 1 hour expiry
-            Cache::put($key, 1, 3600);
+            return $this->updateExistingTokenCacheData($existingData, $currentTime, $currentDateTime);
+        }
+    }
+    
+    /**
+     * Create new token cache data
+     *
+     * @param \App\Models\User $user
+     * @param int $currentTime
+     * @param string $currentDateTime
+     * @return array
+     */
+    private function createNewTokenCacheData($user, $currentTime, $currentDateTime)
+    {
+        return [
+            'tokenInfo' => [
+                'user_id' => $user->id,
+                'user_email' => $user->email,
+                'first_verified' => $currentTime,
+                'first_verified_datetime' => $currentDateTime,
+                'last_access' => $currentTime,
+                'last_access_datetime' => $currentDateTime,
+                'total_access_count' => 1,
+                'created_at' => $currentTime
+            ],
+            'action' => 'first_cache',
+            'extraData' => ['cache_duration_days' => 365]
+        ];
+    }
+    
+    /**
+     * Update existing token cache data
+     *
+     * @param string $existingData
+     * @param int $currentTime
+     * @param string $currentDateTime
+     * @return array
+     */
+    private function updateExistingTokenCacheData($existingData, $currentTime, $currentDateTime)
+    {
+        $tokenInfo = json_decode($existingData, true);
+        $tokenInfo['last_access'] = $currentTime;
+        $tokenInfo['last_access_datetime'] = $currentDateTime;
+        $tokenInfo['total_access_count'] = ($tokenInfo['total_access_count'] ?? 0) + 1;
+        
+        return [
+            'tokenInfo' => $tokenInfo,
+            'action' => 'cache_updated',
+            'extraData' => ['total_access_count' => $tokenInfo['total_access_count']]
+        ];
+    }
+    
+
+    
+    /**
+     * Execute cache operations using Redis pipeline
+     *
+     * @param string $token
+     * @param array $cacheData
+     * @return void
+     */
+    private function executeCacheOperations($token, $cacheData)
+    {
+        $tokenCacheKey = "valid_token:{$token}";
+        $cacheExpiry = 365 * 24 * 60 * 60; // 365 days
+        
+        // Prepare cache log data
+        $cacheLogData = [
+            'token_hash' => substr($token, 0, 8) . '...',
+            'user_id' => $cacheData['tokenInfo']['user_id'],
+            'user_email' => $cacheData['tokenInfo']['user_email'],
+            'action' => $cacheData['action'],
+            'timestamp' => time(),
+            'datetime' => date('Y-m-d H:i:s'),
+            'extra' => $cacheData['extraData'],
+        ];
+        
+        Redis::pipeline(function ($pipe) use (
+            $tokenCacheKey, $cacheData, $cacheExpiry,
+            $cacheLogData
+        ) {
+            // Cache/update token info
+            $pipe->setex($tokenCacheKey, $cacheExpiry, json_encode($cacheData['tokenInfo']));
+            
+            // Add cache log
+            $this->addTokenCacheLogToPipeline($pipe, $cacheLogData);
+        });
+    }
+
+    /**
+     * Log token cache events
+     *
+     * @param string $token
+     * @param \App\Models\User|null $user
+     * @param string $action
+     * @param array $extra
+     * @return void
+     */
+    private function logTokenCache($token, $user, $action, $extra = [])
+    {
+        try {
+            $logKey = "token_cache_log";
+            $logData = [
+                'token_hash' => $token, // Only log partial hash for privacy
+                'user_id' => $user ? $user->id : null,
+                'user_email' => $user ? $user->email : null,
+                'action' => $action,
+                'timestamp' => time(),
+                'datetime' => date('Y-m-d H:i:s'),
+                'extra' => $extra,
+            ];
+            
+            // Add to log list (keep recent 2000 entries)
+            Redis::lpush($logKey, json_encode($logData));
+            Redis::ltrim($logKey, 0, 1999);
+            Redis::expire($logKey, 30 * 24 * 60 * 60); // 30 days
+            
+            // Log cache events to Laravel log
+            if (in_array($action, ['first_cache', 'cache_invalidated', 'cache_deleted'])) {
+                \Log::warning("Token cache event: {$action}", $logData);
+            }
+            
+        } catch (\Exception $e) {
+            \Log::error("Failed to log token cache: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Check if token is disabled due to security violations
+     *
+     * @param string $token
+     * @throws ApiException
+     */
+    private function checkTokenDisabled($token)
+    {
+        try {
+            $disabledTokenKey = "disabled_token:{$token}";
+            $disabledTokenData = Redis::get($disabledTokenKey);
+
+            if ($disabledTokenData) {
+                $disabledInfo = json_decode($disabledTokenData, true);
+                $reason = $disabledInfo['reason'] ?? 'unknown';
+                $disabledAt = $disabledInfo['disabled_at'] ?? 0;
+                $expiresAt = $disabledInfo['expires_at'] ?? 0;
+                $triggeringIp = $disabledInfo['triggering_ip'] ?? 'unknown';
+
+                if ($disabledAt > 0 && $expiresAt > 0 && time() < $expiresAt) {
+                    $this->logTokenCache($token, null, 'disabled_token_access_attempt', [
+                        'disabled_at' => $disabledAt,
+                        'expires_at' => $expiresAt,
+                        'reason' => $reason,
+                        'triggering_ip' => $triggeringIp,
+                        'current_ip' => $this->getOriginalIp(),
+                        'remaining_disabled_time' => $expiresAt - time()
+                    ]);
+                    
+                    // Provide error code based on the reason
+                    $errorCode = match($reason) {
+                        'too_many_ips_5min' => '1012',
+                        'too_many_ips_24h' => '1011',
+                        default => '1014'
+                    };
+                    
+                    throw new ApiException('Access Denied(' . $errorCode . ')', 200);
+                }
+            }
+        } catch (ApiException $e) {
+            throw $e; // Re-throw ApiException
+        } catch (\Exception $e) {
+            \Log::error("Failed to check token disabled status: " . $e->getMessage(), [
+                'token' => substr($token, 0, 8) . '...',
+                'exception' => $e->getTraceAsString()
+            ]);
         }
     }
 
     /**
      * 获取客户端的原始IP地址
      * 
+     * @param \Illuminate\Http\Request|null $request
      * @return string
      */
-    protected function getOriginalIp(): string
+    protected function getOriginalIp($request = null): string
     {
-        $request = request();
+        $request = $request ?: request();
         
         // 首先检查请求参数中是否有ip参数
         if ($request->has('ip')) {
