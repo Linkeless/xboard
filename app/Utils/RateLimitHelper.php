@@ -253,6 +253,27 @@ class RateLimitHelper
         
         // Check if limit exceeded
         if (count($trackingData['user_ids']) >= $maxDifferentUsers) {
+            // Check whitelist before applying too_many_user_accounts restriction
+            if (self::isIpWhitelisted($ip)) {
+                // Log whitelist protection event
+                $whitelistLogData = self::createIpUserAccessLogData($ip, $userId, 'too_many_users_blocked_whitelist', $token, [
+                    'message' => 'Too many user accounts accessed, but IP is whitelisted',
+                    'user_ids_accessed' => $trackingData['user_ids'],
+                    'access_count' => count($trackingData['user_ids']),
+                    'max_allowed' => $maxDifferentUsers
+                ]);
+                
+                Redis::pipeline(function ($pipe) use ($trackingKey, $trackingPeriod, $trackingData, $whitelistLogData) {
+                    // Update tracking data
+                    $pipe->setex($trackingKey, $trackingPeriod, json_encode($trackingData));
+                    
+                    // Add whitelist protection log
+                    self::addIpUserAccessLogToPipeline($pipe, $whitelistLogData);
+                });
+                
+                return; // Allow access for whitelisted IPs even with many users
+            }
+            
             self::blacklistIpForTooManyUsers($ip, $userId, $trackingData, $maxDifferentUsers, $trackingKey, $token);
             throw new ApiException('Access Denied(1013)', 200);
         }
