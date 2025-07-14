@@ -14,6 +14,7 @@ use App\Models\User;
 use App\Services\AuthService;
 use App\Utils\Helper;
 use App\Utils\HmacHelper;
+use App\Utils\TokenCacheHelper;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -23,6 +24,10 @@ class UserController extends Controller
     {
         $user = User::find($request->input('id'));
         if (!$user) return $this->fail([400202,'用户不存在']);
+        
+        // 删除该用户的所有valid_token缓存
+        TokenCacheHelper::deleteValidTokensByUserId($user->id, 'user_secret_reset');
+        
         $user->token = Helper::guid();
         $user->uuid = Helper::guid(true);
         return $this->success($user->save());

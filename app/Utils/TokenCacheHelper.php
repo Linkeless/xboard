@@ -27,6 +27,9 @@ class TokenCacheHelper
             
             // Execute Redis operations
             self::executeCacheOperations($token, $cacheData);
+            
+            // 增加 userId-token 映射
+            Redis::sadd("user_tokens:{$user->id}", $token);
                 
         } catch (\Exception $e) {
             \Log::error("Failed to cache valid token: " . $e->getMessage(), [
@@ -300,5 +303,161 @@ class TokenCacheHelper
         $pipe->lpush($logKey, json_encode($logData));
         $pipe->ltrim($logKey, 0, 1999);
         $pipe->expire($logKey, 30 * 24 * 60 * 60);
+    }
+
+    /**
+     * Delete valid token from cache
+     *
+     * @param string $token
+     * @param \App\Models\User|null $user
+     * @param string $reason
+     * @return bool
+     */
+    public static function deleteValidToken($token, $user = null, $reason = 'manual_deletion')
+    {
+        try {
+            $tokenCacheKey = "valid_token:{$token}";
+            $cachedTokenData = Redis::get($tokenCacheKey);
+            
+            if (!$cachedTokenData) {
+                return false; // Token not found in cache
+            }
+            
+            $tokenInfo = json_decode($cachedTokenData, true);
+            $deletedUser = $user ?: \App\Models\User::find($tokenInfo['user_id'] ?? null);
+            $userId = $deletedUser ? $deletedUser->id : ($tokenInfo['user_id'] ?? null);
+            
+            // Delete the token from cache
+            Redis::del($tokenCacheKey);
+            
+            // 删除 userId-token 映射
+            if ($userId) {
+                Redis::srem("user_tokens:{$userId}", $token);
+            }
+            // Log the deletion
+            self::logTokenCache($token, $deletedUser, 'cache_deleted', [
+                'reason' => $reason,
+                'deleted_at' => time(),
+                'deleted_datetime' => date('Y-m-d H:i:s'),
+                'cached_user_id' => $tokenInfo['user_id'] ?? null,
+                'cached_user_email' => $tokenInfo['user_email'] ?? null,
+                'total_access_count' => $tokenInfo['total_access_count'] ?? 0,
+                'first_verified' => $tokenInfo['first_verified'] ?? null,
+                'last_access' => $tokenInfo['last_access'] ?? null
+            ]);
+            
+            \Log::info("Valid token deleted from cache", [
+                'token' => substr($token, 0, 8) . '...',
+                'user_id' => $deletedUser ? $deletedUser->id : null,
+                'reason' => $reason
+            ]);
+            
+            return true;
+            
+        } catch (\Exception $e) {
+            \Log::error("Failed to delete valid token: " . $e->getMessage(), [
+                'token' => substr($token, 0, 8) . '...',
+                'user_id' => $user ? $user->id : null,
+                'reason' => $reason,
+                'exception' => $e->getTraceAsString()
+            ]);
+            return false;
+        }
+    }
+
+    /**
+     * Delete multiple valid tokens by user ID
+     *
+     * @param int $userId
+     * @param string $reason
+     * @return int Number of tokens deleted
+     */
+    public static function deleteValidTokensByUserId($userId, $reason = 'user_tokens_cleanup')
+    {
+        try {
+            $user = \App\Models\User::find($userId);
+            if (!$user) {
+                return 0;
+            }
+            
+            // 优先通过 user_tokens:{userId} set 获取所有 token
+            $deletedCount = 0;
+            $userTokensKey = "user_tokens:{$userId}";
+            $tokens = Redis::smembers($userTokensKey);
+            foreach ($tokens as $token) {
+                if (self::deleteValidToken($token, $user, $reason)) {
+                    $deletedCount++;
+                }
+            }
+            // 删除 user_tokens set
+            Redis::del($userTokensKey);
+            
+            \Log::info("Deleted {$deletedCount} valid tokens for user", [
+                'user_id' => $userId,
+                'user_email' => $user->email,
+                'reason' => $reason
+            ]);
+            
+            return $deletedCount;
+            
+        } catch (\Exception $e) {
+            \Log::error("Failed to delete valid tokens by user ID: " . $e->getMessage(), [
+                'user_id' => $userId,
+                'reason' => $reason,
+                'exception' => $e->getTraceAsString()
+            ]);
+            return 0;
+        }
+    }
+
+    /**
+     * Clear all valid tokens (use with caution)
+     *
+     * @param string $reason
+     * @return int Number of tokens deleted
+     */
+    public static function clearAllValidTokens($reason = 'system_cleanup')
+    {
+        try {
+            $deletedCount = 0;
+            $cursor = '0';
+            $redisPrefix = config('database.redis.options.prefix', '');
+            $pattern = "{$redisPrefix}valid_token:*";
+            
+            do {
+                $result = Redis::scan($cursor, '*token*', 100);
+                if ($result === false) {
+                    $errorMessage = Redis::getLastError();
+                    \Log::error("Redis SCAN command failed", [
+                        'cursor_before_scan' => $cursor,
+                        'pattern' => $pattern,
+                        'redis_last_error' => $errorMessage,
+                        'reason' => $reason,
+                    ]);
+                    break;
+                }
+                $keys = $result[1];
+                if (!empty($keys)) {
+                    Redis::del($keys);
+                    $deletedCount += count($keys);
+                }
+            } while ($cursor !== '0');
+            
+            if ($deletedCount > 0) {
+                \Log::warning("Cleared all valid tokens from cache", [
+                    'deleted_count' => $deletedCount,
+                    'reason' => $reason
+                ]);
+            }
+            
+            return $deletedCount;
+            
+        } catch (\Exception $e) {
+            \Log::error("Failed to clear all valid tokens: " . $e->getMessage(), [
+                'reason' => $reason,
+                'exception' => $e->getTraceAsString()
+            ]);
+            return 0;
+        }
     }
 } 

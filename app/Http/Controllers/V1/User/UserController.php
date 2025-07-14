@@ -16,6 +16,7 @@ use App\Services\UserService;
 use App\Utils\CacheKey;
 use App\Utils\Helper;
 use App\Utils\HmacHelper;
+use App\Utils\TokenCacheHelper;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 
@@ -160,6 +161,9 @@ class UserController extends Controller
         if (!$user) {
             return $this->fail([400, __('The user does not exist')]);
         }
+        // 删除该用户的所有valid_token缓存
+        TokenCacheHelper::deleteValidTokensByUserId($user->id, 'user_secret_reset');
+                
         $user->uuid = Helper::guid(true);
         $user->token = Helper::guid();
         if (!$user->save()) {
